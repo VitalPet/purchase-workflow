@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 ##############################################################################
 #
-#    Author: Leonardo Pistone
+#    Author: Guewen Baconnier
 #    Copyright 2014 Camptocamp SA
 #
 #    This program is free software: you can redistribute it and/or modify
@@ -18,30 +18,26 @@
 #    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 ##############################################################################
-{'name': 'Add hooks to the merge PO feature.',
- 'version': '0.1',
+
+{'name': 'Purchase - Analytic Account Global',
+ 'version': '1.0',
  'author': "Camptocamp,Odoo Community Association (OCA)",
  'maintainer': 'Camptocamp',
+ 'license': 'AGPL-3',
  'category': 'Purchase Management',
- 'complexity': "normal",
- 'depends': ['purchase'],
+ 'complexity': "easy",
+ 'depends': ['purchase',
+             ],
  'description': """
- In the core OpenERP purchase module, there is a wizard to merge purchase
- orders. That feature is convenient, but as soon as a field is added to the
- purchase order, it does not work anymore and needs to be patched.
- The original implementation does not provide any hooks for extension, and
- modules can only reimplement a method completely. This required a lot of copy
- and paste, and worse, it breaks if two modules attempt to do that.
+Purchase - Analytic Account Global
+==================================
 
- Therefore, this module reimplements the feature, with the same basic result
- in the standard case. Hooks are provided for extra modules that add fields
- or change the logic.
- """,
- 'website': 'http://www.camptocamp.com/',
- 'data': [],
+Adds an analytic account on the purchases that is applied on all the lines.
+""",
+ 'website': 'http://www.camptocamp.com',
+ 'data': ['purchase_view.xml',
+          ],
+ 'test': [],
  'installable': True,
  'auto_install': False,
- 'license': 'AGPL-3',
- 'application': False,
- 'test': ['test/merge_order.yml'],
  }
