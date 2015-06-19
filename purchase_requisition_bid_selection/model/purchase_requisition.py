@@ -21,9 +21,8 @@
 from openerp import models, fields, api, osv
 from openerp.exceptions import except_orm
 import openerp.osv.expression as expression
-from openerp.tools.safe_eval import safe_eval as eval
+from openerp.tools.safe_eval import safe_eval
 from openerp.tools.translate import _
-from openerp import netsvc
 from openerp.tools.float_utils import float_compare
 
 
@@ -41,7 +40,8 @@ class PurchaseRequisitionClassic(osv.orm.Model):
             [('draft', 'Draft'),
              ('in_progress', 'Confirmed'),
              ('open', 'Bids Selection'),
-             ('closed', 'Bids Selected'),  # added
+             ('selected', 'Bids Selected'),  # added
+             ('closed', 'Selection Closed'),  # added
              ('done', 'PO Created'),
              ('cancel', 'Canceled')],
             'Status',
@@ -50,9 +50,15 @@ class PurchaseRequisitionClassic(osv.orm.Model):
         'purchase_ids': osv.fields.one2many(
             'purchase.order',
             'requisition_id',
-            'Purchase Orders',
+            'RFQs and Bids',
             states={'done': [('readonly', True)]},
             domain=[('type', 'in', ('rfq', 'bid'))]),
+        'generated_order_ids': osv.fields.one2many(
+            'purchase.order',
+            'requisition_id',
+            'Generated Purchase Orders',
+            states={'done': [('readonly', True)]},
+            domain=[('type', '=', 'purchase')]),
     }
 
 
@@ -65,6 +71,8 @@ class PurchaseRequisition(models.Model):
         [('open', 'Open'),
          ('restricted', 'Restricted')],
         'Call for Bids Mode',
+        required=True,
+        default='open',
         help="- Restricted : you select yourself the bidders and generate a "
              "RFQ for each of those. \n- Open : anybody can bid (you have to "
              "advertise the call for bids) and you directly encode the bids "
@@ -80,13 +88,6 @@ class PurchaseRequisition(models.Model):
              "be opened \nall at the same time after an opening ceremony "
              "(probably specific to public sector).",
         default='open')
-    consignee_id = fields.Many2one(
-        'res.partner',
-        'Consignee',
-        help="Person responsible of delivery")
-    dest_address_id = fields.Many2one(
-        'res.partner',
-        'Delivery Address')
     req_incoterm_id = fields.Many2one(
         'stock.incoterms',
         'Requested Incoterms',
@@ -102,6 +103,7 @@ class PurchaseRequisition(models.Model):
         'account.payment.term',
         'Requested Payment Term',
         help="Default value requested to the supplier.")
+    req_terms_of_payment = fields.Char('Requested Terms of Payment')
     pricelist_id = fields.Many2one(
         'product.pricelist',
         'Pricelist',
@@ -113,6 +115,22 @@ class PurchaseRequisition(models.Model):
         help="All bids received after that date won't be valid (probably "
              "specific to public sector).")
     delivery_remark = fields.Text('Delivery Remarks')
+    budget = fields.Float()
+    selection_reasons = fields.Text(copy=False)
+
+    # Report fields
+    bid_ids = fields.One2many(
+        comodel_name='purchase.order',
+        inverse_name='requisition_id',
+        domain=[('type', '=', 'bid')],
+    )
+    eligible_bid_ids = fields.One2many(
+        comodel_name='purchase.order',
+        inverse_name='requisition_id',
+        domain=[('type', '=', 'bid'),
+                ('state', 'in', ('draftbid', 'bid')),
+                ('bid_eligible', '=', True)],
+    )
 
     @api.multi
     def _has_product_lines(self):
@@ -133,8 +151,6 @@ class PurchaseRequisition(models.Model):
         values = super(PurchaseRequisition, self
                        )._prepare_purchase_order(requisition, supplier)
         values.update({
-            'dest_address_id': requisition.dest_address_id.id,
-            'consignee_id': requisition.consignee_id.id,
             'bid_validity': requisition.req_validity,
             'payment_term_id': requisition.req_payment_term_id.id,
             'incoterm_id': requisition.req_incoterm_id.id,
@@ -160,42 +176,6 @@ class PurchaseRequisition(models.Model):
         )
         return vals
 
-    def onchange_dest_address_id(self, cr, uid, ids, dest_address_id,
-                                 picking_type_id, context=None):
-        PickType = self.pool['stock.picking.type']
-        type_ids = PickType.search(cr, uid, [
-            ('warehouse_id.partner_id', '=', dest_address_id)
-        ], context=context)
-
-        if type_ids:
-            if picking_type_id not in type_ids:
-                picking_type_id = type_ids[0]
-        else:
-            picking_type_id = False
-        return {'value': {'picking_type_id': picking_type_id}}
-
-    def onchange_picking_type_id(self, cr, uid, ids, picking_type_id,
-                                 context=None):
-        PickType = self.pool['stock.picking.type']
-
-        dest_address_id = False
-
-        if picking_type_id:
-            pick_type = PickType.browse(cr, uid, picking_type_id,
-                                        context=context)
-
-            if pick_type.warehouse_id and pick_type.warehouse_id.partner_id:
-                dest_address_id = pick_type.warehouse_id.partner_id.id
-
-        return {'value': {'dest_address_id': dest_address_id}}
-
-    def trigger_validate_po(self, cr, uid, po_id, context=None):
-        wf_service = netsvc.LocalService("workflow")
-        wf_service.trg_validate(uid, 'purchase.order', po_id, 'draft_po', cr)
-        po_obj = self.pool.get('purchase.order')
-        po_obj.write(cr, uid, po_id, {'bid_partial': False}, context=context)
-        return True
-
     @api.model
     def check_valid_quotation(self, quotation):
         return False
@@ -208,6 +188,7 @@ class PurchaseRequisition(models.Model):
         result.update({
             'type': 'purchase',
             'state': 'draftpo',
+            'keep_in_draft': True,
         })
         return result
 
@@ -222,7 +203,9 @@ class PurchaseRequisition(models.Model):
                     not po_line.order_id.bid_partial):
                 po_line.order_id.bid_partial = True
 
-        return super(PurchaseRequisition, self).generate_po()
+        result = super(PurchaseRequisition, self).generate_po()
+        self.generated_order_ids.write({'keep_in_draft': False})
+        return result
 
     @api.model
     def quotation_selected(self, quotation):
@@ -236,13 +219,13 @@ class PurchaseRequisition(models.Model):
         return quotation.bid_partial
 
     @api.model
-    def cancel_quotation(self, tender):
+    def cancel_unconfirmed_quotations(self, tender):
         """
         Called from generate_po. Cancel only draft and sent rfq
         """
         tender.refresh()
         for quotation in tender.purchase_ids:
-            if quotation.state in ['draft', 'sent', 'bid']:
+            if quotation.state in ['draft', 'sent', 'draftbid', 'bid']:
                 if self.quotation_selected(quotation):
                     quotation.signal_workflow('select_requisition')
                 else:
@@ -267,34 +250,29 @@ class PurchaseRequisition(models.Model):
                 elif purchase.state != 'cancel':
                     rfq_valid = True
         if pos_to_cancel:
-            reason_id = self.env['ir.model.data'].xmlid_to_res_id(
-                'purchase_extended.purchase_cancelreason_rfq_canceled')
-            pos_to_cancel.write({'cancel_reason': reason_id})
+            reason = self.env.ref(
+                'purchase_rfq_bid_workflow.'
+                'purchase_cancel_reason_rfq_canceled')
+            pos_to_cancel.write({'cancel_reason': reason.id})
             pos_to_cancel.action_cancel()
         if not rfq_valid:
             raise except_orm(
                 _('Error'), _('You do not have valid sent RFQs.'))
         return super(PurchaseRequisition, self).tender_open()
 
-    @api.one
+    @api.multi
     def _get_po_to_cancel(self):
-        """Get the list of PO/RFQ that can be canceled on RFQ
-
-        :param callforbids: `purchase.requisition` record
+        """Get the list of PO/RFQ that can be cancelled on RFQ
 
         :returns: List of candidate PO/RFQ record
 
         """
-        orders = []
-        for purchase in self.purchase_ids:
-            if purchase.state in ('draft', 'sent'):
-                orders.append(purchase)
-        return orders
+        purchases = self.mapped('purchase_ids')
+        return purchases.filtered(lambda rec: rec.state in ('draft', 'sent'))
 
     @api.one
     def _check_can_be_canceled(self):
         """Raise an exception if callforbids can not be cancelled
-        :param callforbids: `purchase.requisition` record
 
         :returns: True or raise exception
 
@@ -316,37 +294,50 @@ class PurchaseRequisition(models.Model):
         :returns: cancel po record list
 
         """
-        for order in po_list:
-            order.cancel_reason = reason_id
-            # passing full list raises assert error
-            order.action_cancel_no_reason()
+        po_list.write({'cancel_reason': reason_id})
+        po_list.signal_workflow('purchase_cancel')
         return po_list
 
     @api.model
     def _get_default_reason(self):
         """Return default cancel reason"""
-        IrModelData = self.env['ir.model.data']
-        ref = ('purchase_requisition_bid_selection'
-               '.purchase_cancelreason_rfq_canceled')
-        reason_id = IrModelData.xmlid_to_res_id(ref)
-        return reason_id
+        reason = self.env.ref('purchase_requisition_bid_selection'
+                              '.purchase_cancelreason_callforbids_canceled')
+        return reason.id
 
     @api.multi
     def tender_cancel(self):
         """
-        Cancel call for bids and try to cancelrelated  RFQs/PO
+        Cancel call for bids and try to cancel related RFQs/PO
 
         """
         reason_id = self._get_default_reason()
         for callforbid in self:
             callforbid._check_can_be_canceled()
-            po_to_cancel = self._get_po_to_cancel()
-            if po_to_cancel:
-                self._cancel_po_with_reason(po_to_cancel, reason_id)
+        po_to_cancel = self._get_po_to_cancel()
+        if po_to_cancel:
+            self._cancel_po_with_reason(po_to_cancel, reason_id)
         self.state = 'cancel'
 
     @api.multi
-    def tender_close(self):
+    def update_selection_reasons(self):
+        wizard = self.env['purchase.action_modal.'
+                          'ask_selection_reasons'].browse(
+            self.env.context['active_id']
+        )
+        self.selection_reasons = wizard.selection_reasons
+        self.signal_workflow('bid_selected')
+
+    @api.multi
+    def tender_selected(self):
+        self.state = 'selected'
+
+    @api.multi
+    def act_tender_closed(self):
+        self.signal_workflow('close_bid')
+
+    @api.multi
+    def tender_closed(self):
         self.state = 'closed'
 
     @api.multi
@@ -357,7 +348,7 @@ class PurchaseRequisition(models.Model):
         """
         ActWindow = self.env['ir.actions.act_window']
         res = ActWindow.for_xml_id('purchase', 'purchase_rfq')
-        res['domain'] = expression.AND([eval(res.get('domain', [])),
+        res['domain'] = expression.AND([safe_eval(res.get('domain', [])),
                                        [('requisition_id', 'in', self.ids)]])
         # FIXME: need to disable create - temporarily set as invisible in view
         return res
@@ -370,12 +361,12 @@ class PurchaseRequisition(models.Model):
         """
         ActWindow = self.env['ir.actions.act_window']
         res = ActWindow.for_xml_id('purchase', 'purchase_form_action')
-        res['domain'] = expression.AND([eval(res.get('domain', [])),
+        res['domain'] = expression.AND([safe_eval(res.get('domain', [])),
                                        [('requisition_id', 'in', self.ids)]])
         return res
 
     @api.multi
-    def close_callforbids(self):
+    def confirm_selection(self):
         """
         Check all quantities have been sourced
         """
@@ -393,27 +384,45 @@ class PurchaseRequisition(models.Model):
             if compare != 0:
                 break  # too much or too few selected
         else:
-            return self.close_callforbids_ok()
+            return self.ask_selection_reasons()
 
         # open a dialog to confirm that we want more / less or no qty
         ctx = self.env.context.copy()
 
-        ctx.update({'action': 'close_callforbids_ok',
+        ctx.update({'action': 'ask_selection_reasons',
                     'active_model': self._name,
+                    'active_ids': self._ids,
                     })
-        IrModelData = self.env['ir.model.data']
-        ref = (
-            'purchase_requisition_bid_selection.action_modal_close_callforbids'
-        )
-        view_id = IrModelData.xmlid_to_res_id(ref)
-
+        view = self.env.ref('purchase_requisition_bid_selection'
+                            '.action_modal_confirm_different_quantity')
         return {
             'type': 'ir.actions.act_window',
             'view_type': 'form',
             'view_mode': 'form',
             'res_model': 'purchase.action_modal',
-            'view_id': view_id,
-            'views': [(view_id, 'form')],
+            'view_id': view.id,
+            'views': [(view.id, 'form')],
+            'target': 'new',
+            'context': ctx,
+        }
+
+    @api.multi
+    def ask_confirmation_to_close_selection(self):
+        ctx = self.env.context.copy()
+
+        ctx.update({'action': 'act_tender_closed',
+                    'active_model': self._name,
+                    'active_ids': self._ids,
+                    })
+        view = self.env.ref('purchase_requisition_bid_selection'
+                            '.modal_confirm_close_selection')
+        return {
+            'type': 'ir.actions.act_window',
+            'view_type': 'form',
+            'view_mode': 'form',
+            'res_model': 'purchase.action_modal',
+            'view_id': view.id,
+            'views': [(view.id, 'form')],
             'target': 'new',
             'context': ctx,
         }
@@ -434,9 +443,27 @@ class PurchaseRequisition(models.Model):
         return res
 
     @api.multi
-    def close_callforbids_ok(self):
-        self.signal_workflow('close_bid')
-        return False
+    def ask_selection_reasons(self):
+        ctx = self._context.copy()
+        ctx.update({
+            'action': 'update_selection_reasons',
+            'active_model': self._name,
+            'active_ids': self._ids,
+            'default_selection_reasons': self.selection_reasons,
+        })
+        view = self.env.ref('purchase_requisition_bid_selection.'
+                            'ask_selection_reasons')
+
+        return {
+            'type': 'ir.actions.act_window',
+            'view_type': 'form',
+            'view_mode': 'form',
+            'res_model': 'purchase.action_modal.ask_selection_reasons',
+            'view_id': view.id,
+            'views': [(view.id, 'form')],
+            'target': 'new',
+            'context': ctx,
+        }
 
 
 class PurchaseRequisitionLine(models.Model):
@@ -456,6 +483,6 @@ class PurchaseRequisitionLine(models.Model):
             name = ""
             if line.schedule_date:
                 name += '%s ' % line.schedule_date
-            name += '%s %s' % (line.product_qty, line.product_id)
+            name += '%s %s' % (line.product_qty, line.product_id.name)
             res.append((line.id, name))
         return res

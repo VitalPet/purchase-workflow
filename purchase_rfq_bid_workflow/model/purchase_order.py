@@ -54,6 +54,11 @@ class PurchaseOrderClassic(osv.orm.Model):
             "in exception.",
             select=True,
             copy=False),
+        # Adds track_visibility
+        'bid_validity': osv.fields.date(
+            'Bid Valid Until',
+            track_visibility='always',
+            help="Date on which the bid expired"),
     }
 
     def _default_state(self, cr, uid, context=None):
@@ -88,15 +93,20 @@ class PurchaseOrder(models.Model):
         ('purchase', 'Purchase Order')
     ]
 
+    STATES = {
+        'draft': [('readonly', False)],
+        'sent': [('readonly', False)],
+        'draftbid': [('readonly', False)],
+        'bid': [('readonly', False)],
+        'draftpo': [('readonly', False)],
+    }
+
     type = fields.Selection(
         TYPE_SELECTION,
         'Type',
         required=True,
         readonly=True,
         default=_default_type)
-    consignee_id = fields.Many2one(
-        'res.partner', 'Consignee',
-        help="The person to whom the shipment is to be delivered.")
     incoterm_address = fields.Char(
         'Incoterms Place',
         help="Incoterms Place of Delivery. "
@@ -105,6 +115,27 @@ class PurchaseOrder(models.Model):
              "international transactions.")
     cancel_reason_id = fields.Many2one(
         'purchase.cancel_reason', 'Reason for Cancellation', readonly=True)
+
+    # in pricelist_id and currency_id we change readonly and states to make
+    # them identical and avoid problems where the onchange from pricelist to
+    # currency is reverted in save. However, the user can still set a currency
+    # different from the currency of the pricelist, which is undesirable. See:
+    # https://github.com/odoo/odoo/issues/4598
+    pricelist_id = fields.Many2one(
+        'product.pricelist',
+        'Pricelist',
+        readonly=True,
+        required=True,
+        states=STATES,
+        help="The pricelist sets the currency used for this purchase order. "
+             "It also computes the supplier price for the selected "
+             "products/quantities.")
+    currency_id = fields.Many2one(
+        'res.currency',
+        'Currency',
+        readonly=True,
+        required=True,
+        states=STATES)
 
     @api.model
     def create(self, values):
@@ -155,6 +186,8 @@ class PurchaseOrder(models.Model):
                                          'action_modal_cancel_reason'))[1]
         ctx = self._context.copy()
         ctx['action'] = 'action_cancel_ok'
+        ctx['active_model'] = 'purchase.order'
+        ctx['active_ids'] = self.ids
         # TODO: filter based on po type
         return {
             'type': 'ir.actions.act_window',
@@ -173,8 +206,8 @@ class PurchaseOrder(models.Model):
         assert self._context.get('active_id')
         action_modal = act_modal_cancel_obj.browse(self._context['active_id'])
         self.cancel_reason_id = action_modal.reason_id
-
-        self.signal_workflow('purchase_cancel')
+        # resume the normal course of events for purchase cancel
+        return super(PurchaseOrder, self).action_cancel()
 
     @api.multi
     def wkf_action_cancel(self):
@@ -194,8 +227,8 @@ class PurchaseOrder(models.Model):
         ctx = self._context.copy()
         ctx.update({
             'action': 'bid_received_ok',
-            'default_datetime': (self.bid_date
-                                 or fields.Date.context_today(self)),
+            'default_datetime': (self.bid_date or
+                                 fields.Date.context_today(self)),
         })
         view = self.env.ref('purchase_rfq_bid_workflow.action_modal_bid_date')
 
@@ -260,24 +293,6 @@ class PurchaseOrder(models.Model):
         self.message_post(body=_("Request for Quotation printed"),
                           subtype="mail.mt_comment")
         return super(PurchaseOrder, self).print_quotation()
-
-    def onchange_picking_type_id(self, cr, uid, ids, picking_type_id,
-                                 context=None):
-        PickType = self.pool['stock.picking.type']
-
-        result = super(PurchaseOrder, self).onchange_picking_type_id(
-            cr, uid, ids, picking_type_id, context)
-
-        if picking_type_id:
-            pick_type = PickType.browse(cr, uid, picking_type_id,
-                                        context=context)
-
-            if pick_type.warehouse_id and pick_type.warehouse_id.partner_id:
-                dest_address_id = pick_type.warehouse_id.partner_id.id
-
-                result['value']['dest_address_id'] = dest_address_id
-
-        return result
 
     @api.multi
     def po_tender_requisition_selected(self):
